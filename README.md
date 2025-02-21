@@ -22,7 +22,7 @@ O pipeline segue os seguintes passos:
 
 ## Simulação
 
-![Simulação do Sistema](print-simulacao.png)
+![Simulação do Sistema](print-simulacao.PNG)
 
 A interface exibe um grafo dinâmico representando os estados das conversas em tempo real. Cada nó representa um dos estágios do pipeline. Abaixo está um exemplo da interface:
 
