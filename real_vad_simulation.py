@@ -1,14 +1,15 @@
 import asyncio
 import random
 import string
-import time  # <--- Adicionado
+import time
 from typing import Dict, Any
+import os
 
 import torch
 import sounddevice as sd
 import numpy as np
 
-from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+from silero_vad import load_silero_vad, get_speech_timestamps
 
 ##############################################################################
 #                    IMPLEMENTAÇÃO DO VAD REAL (SILERO)
@@ -16,35 +17,81 @@ from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
 
 class VADReal:
     """
-    Implementa a detecção de fala usando o modelo Silero e a captação do microfone.
+    Detecta fala usando o modelo Silero e capta áudio do microfone.
+    Grava continuamente pequenos trechos até que, após o início da fala,
+    seja detectado um período de silêncio sustentado que sinalize o fim da frase.
     """
-    def __init__(self, threshold=0.5, duration=0.5):
+    def __init__(self, threshold=0.25, segment_duration=0.5):
         self.threshold = threshold
-        self.duration = duration  # duração do trecho a ser analisado (em segundos)
+        self.segment_duration = segment_duration  # duração de cada trecho em segundos
         self.sampling_rate = 16000
-        self.vad = load_silero_vad()        
+        self.vad = load_silero_vad()
 
     def record_audio(self, duration, fs):
-        # print("[VADReal] Capturando áudio do microfone...")
+        # Captura um trecho de áudio do microfone
         audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='float32')
         sd.wait()
         return np.squeeze(audio)
 
-    async def has_speech(self) -> bool:
-        # Captura áudio de forma assíncrona para não bloquear o loop principal
-        audio = await asyncio.to_thread(self.record_audio, self.duration, self.sampling_rate)
-        audio_tensor = torch.tensor(audio).float()
-        # speech_timestamps = self.get_speech_ts(audio_tensor, self.sampling_rate, threshold=self.threshold)
-        # detected = len(speech_timestamps) > 0
-        speech_timestamps = get_speech_timestamps(
-          audio_tensor, 
-          self.vad,
-          return_seconds=True,  # Return speech timestamps in seconds (default is samples)
+    def segment_has_speech(self, audio_segment) -> bool:
+        # Verifica se um trecho contém fala usando get_speech_timestamps
+        audio_tensor = torch.tensor(audio_segment).float()
+        timestamps = get_speech_timestamps(
+            audio_tensor,
+            self.vad,
+            return_seconds=True,
+            threshold=self.threshold
         )
-        detected = len(speech_timestamps) > 0        
-        if detected:
-          print(f"[VADReal] Fala detectada")
-        return detected
+        return len(timestamps) > 0
+
+    async def wait_for_initial_speech(self):
+        """
+        Aguarda até que um segmento contenha fala.
+        Enquanto não houver fala, os segmentos são ignorados.
+        """
+        while True:
+            segment = await asyncio.to_thread(self.record_audio, self.segment_duration, self.sampling_rate)
+            if self.segment_has_speech(segment):
+                print("[VADReal] Fala iniciada!")
+                return
+            await asyncio.sleep(0.1)
+
+    async def record_until_silence(self, min_duration=2.0, silence_required=1.0, max_duration=20.0):
+        """
+        Após o início da fala, grava segmentos consecutivos até que:
+         - Ao menos min_duration segundos tenham sido gravados, e
+         - Um número suficiente de segmentos silenciosos consecutivos seja detectado
+           (suficiente para totalizar silence_required segundos de silêncio).
+        Retorna o áudio acumulado (concatenando os segmentos, removendo os segmentos silenciosos finais).
+        """
+        segments = []
+        total_time = 0.0
+        silence_counter = 0
+        required_silence_segments = int(silence_required / self.segment_duration)
+        while total_time < max_duration:
+            print(f"[VADReal] Gravando ({total_time:.1f}s)...", end=' ')
+            segment = await asyncio.to_thread(self.record_audio, self.segment_duration, self.sampling_rate)
+            segments.append(segment)
+            total_time += self.segment_duration
+            if not self.segment_has_speech(segment):
+                silence_counter += 1
+                print(f"Silêncio ({silence_counter}/{required_silence_segments})")
+                if total_time >= min_duration and silence_counter >= required_silence_segments:
+                    # Remove os segmentos silenciosos finais
+                    segments = segments[:-silence_counter]
+                    print(f"[VADReal] Fim da frase detectado após {total_time:.1f}s")
+                    return np.concatenate(segments) if segments else None
+            else:
+                silence_counter = 0
+                print(f"Fala detectada ({total_time:.1f}s)")
+            await asyncio.sleep(0.05)
+        print(f"[VADReal] Tempo máximo atingido ({max_duration}s)")
+        return np.concatenate(segments) if segments else None
+
+    async def has_speech(self) -> bool:
+        # Método rápido para verificar se um segmento contém fala
+        audio = await asyncio.to_thread(self.record_audio, self.segment_duration, self.sampling_rate)
+        return self.segment_has_speech(audio)
 
 ##############################################################################
 #                          MODELOS E MOCKS
@@ -58,18 +105,19 @@ class PipelineTask:
         self.data = data
 
 class STTMock:
-    async def transcribe(self, audio_data: str) -> str:
-        await asyncio.sleep(random.uniform(1,2))
-        return ''.join(random.choice(string.ascii_lowercase) for _ in range(5))
+    async def transcribe(self, audio_data: Any) -> str:
+        # Simula transcrição; exibe o comprimento do áudio recebido
+        await asyncio.sleep(random.uniform(1, 2))
+        return f"texto_transcrito(len={len(audio_data)})"
 
 class LogicMock:
     async def process(self, text: str) -> str:
-        await asyncio.sleep(random.uniform(1,4))
+        await asyncio.sleep(random.uniform(1, 4))
         return f"Resposta para: {text}"
 
 class TTSMock:
     async def synthesize(self, text: str):
-        await asyncio.sleep(random.uniform(2,4))
+        await asyncio.sleep(random.uniform(2, 4))
         print(f"[TTS] Falando: {text}")
 
 ##############################################################################
@@ -85,23 +133,16 @@ async def stt_worker(stt_queue: asyncio.Queue,
         if not orchestrator.is_turn_valid(task.conversation_id, task.turn_id):
             stt_queue.task_done()
             continue
-
         orchestrator.update_stage(task.conversation_id, "STT")
-
         start_time = time.time()
         text = await stt_module.transcribe(task.data)
         elapsed = time.time() - start_time
-
         orchestrator.update_status(task.conversation_id,
-            f"STT -> Texto: {text} (time: {elapsed:.2f}s)")
+            f"STT -> {text} (time: {elapsed:.2f}s)")
         orchestrator.record_pipeline_step(
-            task.conversation_id,
-            task.turn_id,
-            "STT",
-            f"{text} (time: {elapsed:.2f}s)"
+            task.conversation_id, task.turn_id, "STT", f"{text} (time: {elapsed:.2f}s)"
         )
-
-        new_task = PipelineTask(task.conversation_id, task.turn_id, "logic", text)
+        new_task = PipelineTask(task.conversation_id, task.turn_id, "Logic", text)
         await logic_queue.put(new_task)
         stt_queue.task_done()
 
@@ -114,23 +155,16 @@ async def logic_worker(logic_queue: asyncio.Queue,
         if not orchestrator.is_turn_valid(task.conversation_id, task.turn_id):
             logic_queue.task_done()
             continue
-
         orchestrator.update_stage(task.conversation_id, "Logic")
-
         start_time = time.time()
         reply_text = await logic_module.process(task.data)
         elapsed = time.time() - start_time
-
         orchestrator.update_status(task.conversation_id,
-            f"Lógica -> {reply_text} (time: {elapsed:.2f}s)")
+            f"Logic -> {reply_text} (time: {elapsed:.2f}s)")
         orchestrator.record_pipeline_step(
-            task.conversation_id,
-            task.turn_id,
-            "Logic",
-            f"{reply_text} (time: {elapsed:.2f}s)"
+            task.conversation_id, task.turn_id, "Logic", f"{reply_text} (time: {elapsed:.2f}s)"
         )
-
-        new_task = PipelineTask(task.conversation_id, task.turn_id, "tts", reply_text)
+        new_task = PipelineTask(task.conversation_id, task.turn_id, "TTS", reply_text)
         await tts_queue.put(new_task)
         logic_queue.task_done()
 
@@ -142,16 +176,12 @@ async def tts_worker(tts_queue: asyncio.Queue,
         if not orchestrator.is_turn_valid(task.conversation_id, task.turn_id):
             tts_queue.task_done()
             continue
-
         orchestrator.update_stage(task.conversation_id, "TTS")
-
         total_duration = random.uniform(2, 4)
         increments = 10
         step = total_duration / increments
-
         orchestrator.update_status(task.conversation_id,
             f"Iniciando TTS (~{total_duration:.1f}s)")
-
         tts_start_time = time.time()
         interrupted = False
         for _ in range(increments):
@@ -159,7 +189,6 @@ async def tts_worker(tts_queue: asyncio.Queue,
             if not orchestrator.is_turn_valid(task.conversation_id, task.turn_id):
                 interrupted = True
                 break
-
         if interrupted:
             orchestrator.set_turn_status(task.conversation_id, task.turn_id, "INTERRUPTED")
             orchestrator.update_status(task.conversation_id, "TTS interrompido abruptamente!")
@@ -172,10 +201,7 @@ async def tts_worker(tts_queue: asyncio.Queue,
             orchestrator.update_status(task.conversation_id,
                 f"TTS finalizado: {task.data} (time: {tts_elapsed:.2f}s)")
             orchestrator.record_pipeline_step(
-                task.conversation_id,
-                task.turn_id,
-                "TTS",
-                f"{task.data} (time: {tts_elapsed:.2f}s)"
+                task.conversation_id, task.turn_id, "TTS", f"{task.data} (time: {tts_elapsed:.2f}s)"
             )
             orchestrator.update_stage(task.conversation_id, "TTSUser")
             await asyncio.sleep(1.0)
@@ -184,7 +210,6 @@ async def tts_worker(tts_queue: asyncio.Queue,
             conv = orchestrator.conversations.get(task.conversation_id)
             if conv:
                 conv.pipeline_finished()
-
         tts_queue.task_done()
 
 ##############################################################################
@@ -198,44 +223,40 @@ class Conversation:
         self._running = True
         self.current_turn_id = 0
         self.pipeline_in_progress = False
-        # Usa o VAD real (Silero) com duração menor para detecção mais ágil
-        self.vad = VADReal(duration=0.5)
+        self.vad = VADReal(segment_duration=0.5)
 
     async def run(self):
         while self._running:
-            if not self.pipeline_in_progress:
-                # Verifica se há fala para iniciar um novo turno
-                if await self.vad.has_speech():
-                    await self.start_new_turn()
-            else:
-                # Monitora continuamente se nova fala ocorre para interromper o turno atual
+            if self.pipeline_in_progress:
+                # Enquanto o pipeline estiver em andamento, monitora nova fala
                 if await self.vad.has_speech():
                     print("[Conversation] Nova fala detectada durante pipeline. Interrompendo...")
-                    self.interrupt()
-                await asyncio.sleep(0.2)
+                    await self.interrupt()
+            else:
+                print("[Conversation] Aguardando início da fala...")
+                await self.vad.wait_for_initial_speech()
+                print("[Conversation] Iniciando gravação completa da frase...")
+                audio_data = await self.vad.record_until_silence(min_duration=2.0, silence_required=1.0)
+                if audio_data is not None and len(audio_data) > 0:
+                    await self.start_new_turn(audio_data)
+            await asyncio.sleep(0.1)
         print(f"[Conversation {self.id}] Encerrada.")
 
-    async def start_new_turn(self):
+    async def start_new_turn(self, audio_data):
         self.current_turn_id += 1
         turn_id = self.current_turn_id
         self.pipeline_in_progress = True
 
         self.orchestrator.init_turn_history(self.id, turn_id)
-        self.orchestrator.update_stage(self.id, "VAD")
-        self.orchestrator.update_status(self.id, f"Nova fala detectada (turn {turn_id})")
-        self.orchestrator.record_pipeline_step(self.id, turn_id, "VAD", "")
+        self.orchestrator.update_stage(self.id, "STT")
+        self.orchestrator.update_status(self.id, f"Frase completa recebida (turn {turn_id})")
+        self.orchestrator.record_pipeline_step(
+            self.id, turn_id, "VAD", f"Áudio recebido (len={len(audio_data)})"
+        )
+        stt_task = PipelineTask(self.id, turn_id, "STT", audio_data)
+        asyncio.create_task(self.orchestrator.stt_queue.put(stt_task))
 
-        await asyncio.sleep(1.0)  # Delay antes de iniciar o STT
-
-        if self._running and self.pipeline_in_progress and self.current_turn_id == turn_id:
-            audio_data = f"audio_chunk_{random.randint(1,100)}"
-            stt_task = PipelineTask(self.id, turn_id, "stt", audio_data)
-            asyncio.create_task(self.orchestrator.stt_queue.put(stt_task))
-
-    def pipeline_finished(self):
-        self.pipeline_in_progress = False
-
-    def interrupt(self):
+    async def interrupt(self):
         if self.pipeline_in_progress:
             old_turn_id = self.current_turn_id
             self.orchestrator.set_turn_status(self.id, old_turn_id, "INTERRUPTED")
@@ -243,8 +264,15 @@ class Conversation:
                 f"Interrupção automática (turn {old_turn_id}) por nova fala")
             self.orchestrator.update_stage(self.id, "VAD")
             self.pipeline_in_progress = False
-            # Inicia automaticamente um novo turno
-            asyncio.create_task(self.start_new_turn())
+            # Inicia a gravação de um novo turn imediatamente
+            print("[Conversation] Gravando nova frase após interrupção...")
+            await self.vad.wait_for_initial_speech()
+            audio_data = await self.vad.record_until_silence(min_duration=2.0, silence_required=1.0)
+            if audio_data is not None and len(audio_data) > 0:
+                await self.start_new_turn(audio_data)
+
+    def pipeline_finished(self):
+        self.pipeline_in_progress = False
 
     def stop(self):
         self._running = False
@@ -265,7 +293,6 @@ class Orchestrator:
 
         self.conversations: Dict[str, Conversation] = {}
         self.workers_tasks = []
-
         self.status_data: Dict[str, Dict[str, Any]] = {}
         self.turns_history: Dict[str, Dict[int, Dict[str, Any]]] = {}
 
@@ -284,11 +311,9 @@ class Orchestrator:
         if conversation_id not in self.status_data:
             self.status_data[conversation_id] = {}
         self.status_data[conversation_id]["message"] = message
-
         conv = self.conversations.get(conversation_id)
         if conv:
             self.status_data[conversation_id]["turn_id"] = conv.current_turn_id
-
         print(f"[Status] {conversation_id}: {message}")
 
     def is_turn_valid(self, conversation_id: str, turn_id: int) -> bool:
@@ -300,20 +325,14 @@ class Orchestrator:
     def init_turn_history(self, conversation_id: str, turn_id: int):
         if conversation_id not in self.turns_history:
             self.turns_history[conversation_id] = {}
-        self.turns_history[conversation_id][turn_id] = {
-            "status": "IN_PROGRESS",
-            "steps": []
-        }
+        self.turns_history[conversation_id][turn_id] = {"status": "IN_PROGRESS", "steps": []}
 
     def record_pipeline_step(self, conversation_id: str, turn_id: int, stage: str, data: str):
         if conversation_id not in self.turns_history:
             self.turns_history[conversation_id] = {}
         if turn_id not in self.turns_history[conversation_id]:
             self.init_turn_history(conversation_id, turn_id)
-        self.turns_history[conversation_id][turn_id]["steps"].append({
-            "stage": stage,
-            "data": data
-        })
+        self.turns_history[conversation_id][turn_id]["steps"].append({"stage": stage, "data": data})
 
     def set_turn_status(self, conversation_id: str, turn_id: int, status: str):
         if conversation_id not in self.turns_history:
@@ -356,15 +375,39 @@ class Orchestrator:
             t.cancel()
         await asyncio.gather(*self.workers_tasks, return_exceptions=True)
 
+    def get_active_module(self) -> str:
+        conv = self.conversations.get("conv1")
+        if conv:
+            return self.status_data.get("conv1", {}).get("stage", "Idle")
+        return "Idle"
+
+##############################################################################
+#                         MONITORAMENTO EM TEMPO REAL
+##############################################################################
+
+async def monitor_status(orchestrator: Orchestrator):
+    while True:
+        active = orchestrator.get_active_module()
+        if active in ["Idle", "INTERRUPTED"]:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("=== STATUS EM TEMPO REAL ===")
+            print(f"Conversa: conv1  |  Módulo ativo: {active}")
+            print("============================\n")
+        for cid, status in orchestrator.status_data.items():
+            print(f"{cid}: {status}")
+        print("\n")
+        await asyncio.sleep(1)
+
 ##############################################################################
 #                           MAIN DA SIMULAÇÃO
 ##############################################################################
 
-async def main():
+async def main(monitor=False):
     orchestrator = Orchestrator()
     await orchestrator.start_workers()
-    # Inicia automaticamente a conversa única "conv1"
     await orchestrator.start_conversation("conv1")
+    if monitor:
+        asyncio.create_task(monitor_status(orchestrator))
     print("Simulação iniciada. Pressione Ctrl+C para encerrar.")
     try:
         while True:
@@ -376,6 +419,9 @@ async def main():
 
 if __name__ == "__main__":
     import sounddevice as sd
+    import sys
     print(sd.query_devices())
-    # sd.default.device = (input_index, output_index)  # substitua pelos índices corretos
-    asyncio.run(main())
+    if 'monitor' in sys.argv:
+        asyncio.run(main(monitor=True))
+    else:
+        asyncio.run(main())
